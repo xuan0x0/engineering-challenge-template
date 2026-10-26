@@ -1,3 +1,4 @@
+pub mod kalshi;
 pub mod util;
 
 mod side;
