@@ -1,8 +1,11 @@
 //! The collector owns every orderbook and the output writer. It is the only
 //! task that writes output, so message order in the file matches the order
 //! events were received across all connections.
+//!
+//! Each symbol is carried by several redundant connections; [`MarketState`]
+//! decides which one is published (see [`crate::market`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -10,10 +13,12 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
-use crate::events::BookEvent;
-use crate::orderbook::OrderBook;
-use crate::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
+use crate::events::{BookEvent, SourcedEvent};
+use crate::market::{MarketState, Output};
 use crate::writer::RotatingWriter;
+
+/// How often lagging sources are checked for failover.
+pub const LAG_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Stats {
@@ -21,103 +26,147 @@ struct Stats {
     deltas: u64,
     orphan_deltas: u64,
     negative_levels: u64,
-}
-
-struct TrackedBook {
-    book: OrderBook,
-    /// Exchange timestamp of the latest event applied to this book. Periodic
-    /// snapshots carry it rather than inventing one.
-    exchange_timestamp: DateTime<Utc>,
+    invalidations: u64,
+    failovers: u64,
 }
 
 pub struct Collector {
-    books: HashMap<String, TrackedBook>,
+    markets: HashMap<String, MarketState>,
+    /// Symbols whose source is currently behind a backup.
+    lagging: HashSet<String>,
+    replica_count: usize,
+    lag_threshold: chrono::Duration,
     writer: RotatingWriter,
     stats: Stats,
 }
 
 impl Collector {
-    pub fn new(writer: RotatingWriter) -> Self {
+    pub fn new(writer: RotatingWriter, replica_count: usize, lag_threshold: Duration) -> Self {
         Self {
-            books: HashMap::new(),
+            markets: HashMap::new(),
+            lagging: HashSet::new(),
+            replica_count,
+            lag_threshold: chrono::Duration::from_std(lag_threshold)
+                .unwrap_or(chrono::Duration::MAX),
             writer,
             stats: Stats::default(),
         }
     }
 
-    pub fn book(&self, symbol: &str) -> Option<&OrderBook> {
-        self.books.get(symbol).map(|t| &t.book)
+    pub fn has_market(&self, symbol: &str) -> bool {
+        self.markets.contains_key(symbol)
     }
 
-    pub fn handle(&mut self, event: BookEvent) -> anyhow::Result<()> {
-        match event {
+    pub fn handle(&mut self, sourced: SourcedEvent) -> anyhow::Result<()> {
+        let replica = sourced.replica;
+        match sourced.event {
             BookEvent::Snapshot {
                 symbol,
                 received_at,
                 exchange_timestamp,
+                sequence,
                 bids,
                 asks,
             } => {
-                let book = OrderBook::from_levels(&bids, &asks);
-                self.writer
-                    .write(&book.to_snapshot(&symbol, received_at, exchange_timestamp))?;
-                self.books.insert(
-                    symbol,
-                    TrackedBook {
-                        book,
-                        exchange_timestamp,
-                    },
+                let market = self
+                    .markets
+                    .entry(symbol.clone())
+                    .or_insert_with(|| MarketState::new(self.replica_count));
+                let out = market.on_snapshot(
+                    &symbol,
+                    replica,
+                    &bids,
+                    &asks,
+                    sequence,
+                    received_at,
+                    exchange_timestamp,
                 );
-                self.stats.snapshots += 1;
+                self.stats.snapshots += u64::from(out.is_some());
+                self.finish(&symbol, out)?;
             }
             BookEvent::Delta {
                 symbol,
                 received_at,
                 exchange_timestamp,
+                sequence,
                 side,
                 price,
                 quantity_delta,
             } => {
-                let Some(tracked) = self.books.get_mut(&symbol) else {
+                let Some(market) = self.markets.get_mut(&symbol) else {
                     // Connections only forward deltas after a snapshot, so this
                     // indicates a bug upstream rather than an exchange issue.
                     tracing::warn!(%symbol, "delta for symbol without a snapshot; dropped");
                     self.stats.orphan_deltas += 1;
                     return Ok(());
                 };
-                tracked.exchange_timestamp = exchange_timestamp;
-                let outcome = tracked.book.apply_delta(side, price, quantity_delta);
-                if outcome.went_negative {
-                    tracing::warn!(%symbol, %side, price, quantity_delta, "level went negative");
+                let (out, info) = market.on_delta(
+                    &symbol,
+                    replica,
+                    side,
+                    price,
+                    quantity_delta,
+                    sequence,
+                    received_at,
+                    exchange_timestamp,
+                );
+                if info.went_negative {
+                    tracing::warn!(%symbol, replica, %side, price, quantity_delta, "level went negative");
                     self.stats.negative_levels += 1;
                 }
-                self.writer.write(&PriceLevelUpdateDomain {
-                    backtest_timestamp: received_at,
-                    exchange_timestamp,
-                    price_level: price,
-                    quantity: outcome.quantity,
-                    side,
-                    symbol,
-                })?;
-                self.stats.deltas += 1;
+                self.stats.deltas += u64::from(info.published);
+                self.finish(&symbol, out)?;
+            }
+            BookEvent::Invalidated { symbols } => {
+                let now = Utc::now();
+                for symbol in symbols {
+                    let Some(market) = self.markets.get_mut(&symbol) else {
+                        continue;
+                    };
+                    self.stats.invalidations += 1;
+                    let out = market.on_invalidated(&symbol, replica, now);
+                    self.stats.failovers += u64::from(out.is_some());
+                    self.finish(&symbol, out)?;
+                }
             }
             BookEvent::Removed { symbol } => {
-                self.books.remove(&symbol);
+                if self
+                    .markets
+                    .get_mut(&symbol)
+                    .is_some_and(|m| m.on_removed(replica))
+                {
+                    self.markets.remove(&symbol);
+                }
+                self.lagging.remove(&symbol);
             }
         }
         Ok(())
     }
 
-    /// Writes a snapshot of every book. `received_at` is `now` (when the
-    /// snapshot was taken); `exchange_timestamp` is that of the book's latest
-    /// exchange event.
+    /// Fails over every symbol whose source has lagged a backup for longer
+    /// than the threshold.
+    pub fn check_lagging(&mut self, now: DateTime<Utc>) -> anyhow::Result<()> {
+        let candidates: Vec<String> = self.lagging.iter().cloned().collect();
+        for symbol in candidates {
+            let Some(market) = self.markets.get_mut(&symbol) else {
+                self.lagging.remove(&symbol);
+                continue;
+            };
+            let out = market.check_lag(&symbol, now, self.lag_threshold);
+            self.stats.failovers += u64::from(out.is_some());
+            self.finish(&symbol, out)?;
+        }
+        Ok(())
+    }
+
+    /// Writes a snapshot of every published book. `received_at` is `now` (when
+    /// the snapshot was taken); `exchange_timestamp` is that of the book's
+    /// latest exchange event.
     pub fn write_all_snapshots(&mut self, now: DateTime<Utc>) -> anyhow::Result<()> {
-        for (symbol, tracked) in &self.books {
-            self.writer.write(&tracked.book.to_snapshot(
-                symbol,
-                now,
-                tracked.exchange_timestamp,
-            ))?;
+        for (symbol, market) in &self.markets {
+            if let Some(snapshot) = market.snapshot(symbol, now) {
+                self.writer.write(&snapshot)?;
+            }
         }
         Ok(())
     }
@@ -136,14 +185,37 @@ impl Collector {
         self.writer.close()
     }
 
+    /// Writes an output (if any) and refreshes the symbol's lagging status.
+    fn finish(&mut self, symbol: &str, out: Option<Output>) -> anyhow::Result<()> {
+        match out {
+            Some(Output::Snapshot(s)) => self.writer.write(&s)?,
+            Some(Output::Update(u)) => self.writer.write(&u)?,
+            None => {}
+        }
+        if self
+            .markets
+            .get(symbol)
+            .is_some_and(MarketState::is_lagging)
+        {
+            if !self.lagging.contains(symbol) {
+                self.lagging.insert(symbol.to_owned());
+            }
+        } else {
+            self.lagging.remove(symbol);
+        }
+        Ok(())
+    }
+
     fn log_and_reset_stats(&mut self) {
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
-            books = self.books.len(),
+            books = self.markets.len(),
             snapshots = s.snapshots,
             deltas = s.deltas,
             orphan_deltas = s.orphan_deltas,
             negative_levels = s.negative_levels,
+            invalidations = s.invalidations,
+            failovers = s.failovers,
             "collector stats since last periodic snapshot"
         );
     }
@@ -156,7 +228,7 @@ impl Collector {
 /// file is closed anyway so buffered data is never lost.
 pub async fn run(
     mut collector: Collector,
-    mut events: mpsc::Receiver<BookEvent>,
+    mut events: mpsc::Receiver<SourcedEvent>,
     snapshot_interval: Duration,
     cancel: CancellationToken,
     drain_timeout: Duration,
@@ -164,6 +236,8 @@ pub async fn run(
     let mut ticker = tokio::time::interval(snapshot_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick fires immediately
+    let mut lag_ticker = tokio::time::interval(LAG_CHECK_INTERVAL);
+    lag_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let drain_deadline = async {
         cancel.cancelled().await;
         tokio::time::sleep(drain_timeout).await;
@@ -180,6 +254,11 @@ pub async fn run(
                 let Some(event) = maybe_event else { break Ok(()) };
                 let now = Utc::now();
                 if let Err(e) = collector.maybe_rotate(now).and_then(|()| collector.handle(event)) {
+                    break Err(e);
+                }
+            }
+            _ = lag_ticker.tick() => {
+                if let Err(e) = collector.check_lagging(Utc::now()) {
                     break Err(e);
                 }
             }
@@ -205,7 +284,9 @@ mod tests {
     use super::*;
     use crate::Side;
     use crate::events::Level;
-    use crate::util::dtos::challenge_orderbook::{AnyMessage, SnapshotDomain};
+    use crate::util::dtos::challenge_orderbook::{
+        AnyMessage, PriceLevelUpdateDomain, SnapshotDomain,
+    };
     use crate::util::{AlignedSbeReader, OrderbookSchema};
     use crate::writer::OutputTarget;
 
@@ -234,11 +315,24 @@ mod tests {
         out
     }
 
-    fn snapshot_event(symbol: &str, at: DateTime<Utc>) -> BookEvent {
+    fn on(replica: usize, event: BookEvent) -> SourcedEvent {
+        SourcedEvent { replica, event }
+    }
+
+    fn snapshot_event(symbol: &str, at: DateTime<Utc>) -> SourcedEvent {
+        on(0, snapshot_on(symbol, at, 1))
+    }
+
+    fn delta_event(symbol: &str, at: DateTime<Utc>, delta: i64) -> SourcedEvent {
+        on(0, delta_on(symbol, at, delta, 2))
+    }
+
+    fn snapshot_on(symbol: &str, at: DateTime<Utc>, sequence: u64) -> BookEvent {
         BookEvent::Snapshot {
             symbol: symbol.to_owned(),
             received_at: at,
             exchange_timestamp: at,
+            sequence: Some(sequence),
             bids: vec![Level {
                 price: 400_000,
                 quantity: 10_000_000,
@@ -250,11 +344,12 @@ mod tests {
         }
     }
 
-    fn delta_event(symbol: &str, at: DateTime<Utc>, delta: i64) -> BookEvent {
+    fn delta_on(symbol: &str, at: DateTime<Utc>, delta: i64, sequence: u64) -> BookEvent {
         BookEvent::Delta {
             symbol: symbol.to_owned(),
             received_at: at,
             exchange_timestamp: at,
+            sequence: Some(sequence),
             side: Side::Buy,
             price: 400_000,
             quantity_delta: delta,
@@ -266,7 +361,11 @@ mod tests {
             dir: dir.to_owned(),
             prefix: "test".to_owned(),
         };
-        Collector::new(RotatingWriter::open(target, at).unwrap())
+        Collector::new(
+            RotatingWriter::open(target, at).unwrap(),
+            2,
+            Duration::from_millis(500),
+        )
     }
 
     #[test]
@@ -307,12 +406,21 @@ mod tests {
 
         collector.handle(snapshot_event("A", t0)).unwrap();
         collector.handle(snapshot_event("B", t0)).unwrap();
-        collector
-            .handle(BookEvent::Removed {
-                symbol: "A".to_owned(),
-            })
-            .unwrap();
-        assert!(collector.book("A").is_none());
+        let removed = |r| {
+            on(
+                r,
+                BookEvent::Removed {
+                    symbol: "A".to_owned(),
+                },
+            )
+        };
+        collector.handle(removed(0)).unwrap();
+        assert!(
+            collector.has_market("A"),
+            "kept until every replica unsubscribes"
+        );
+        collector.handle(removed(1)).unwrap();
+        assert!(!collector.has_market("A"));
         collector.write_all_snapshots(t0).unwrap();
         collector.close().unwrap();
 
@@ -345,6 +453,73 @@ mod tests {
             panic!("expected snapshot")
         };
         assert_eq!((snap.symbol.as_str(), snap.received_at), ("A", t1));
+    }
+
+    #[test]
+    fn failover_writes_backup_snapshot_then_backup_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = ts(1_700_000_000);
+        let mut collector = new_collector(dir.path(), t0);
+        let path = collector.writer.path().to_owned();
+
+        collector.handle(on(0, snapshot_on("A", t0, 1))).unwrap();
+        collector.handle(on(1, snapshot_on("A", t0, 1))).unwrap();
+        // Replica 1 sees an update that replica 0 never delivers.
+        collector
+            .handle(on(1, delta_on("A", t0, 1_000_000, 2)))
+            .unwrap();
+        collector
+            .handle(on(
+                0,
+                BookEvent::Invalidated {
+                    symbols: vec!["A".to_owned()],
+                },
+            ))
+            .unwrap();
+        collector
+            .handle(on(1, delta_on("A", t0, 1_000_000, 3)))
+            .unwrap();
+        collector.close().unwrap();
+
+        let out = read_all(&path);
+        assert_eq!(
+            out.len(),
+            3,
+            "initial snapshot, failover snapshot, one update"
+        );
+        let Out::Snap(failover) = &out[1] else {
+            panic!("expected failover snapshot")
+        };
+        assert_eq!(failover.bids[0].quantity, 11_000_000);
+        let Out::Upd(update) = &out[2] else {
+            panic!("expected update")
+        };
+        assert_eq!(update.quantity, 12_000_000);
+    }
+
+    #[test]
+    fn lagging_source_fails_over_on_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = ts(1_700_000_000);
+        let mut collector = new_collector(dir.path(), t0);
+        let path = collector.writer.path().to_owned();
+
+        collector.handle(on(0, snapshot_on("A", t0, 1))).unwrap();
+        collector.handle(on(1, snapshot_on("A", t0, 1))).unwrap();
+        collector
+            .handle(on(1, delta_on("A", t0, 1_000_000, 2)))
+            .unwrap();
+        collector
+            .check_lagging(t0 + chrono::Duration::milliseconds(100))
+            .unwrap();
+        collector
+            .check_lagging(t0 + chrono::Duration::milliseconds(600))
+            .unwrap();
+        collector.close().unwrap();
+
+        let out = read_all(&path);
+        assert_eq!(out.len(), 2, "initial snapshot + failover snapshot");
+        assert!(matches!(&out[1], Out::Snap(s) if s.bids[0].quantity == 11_000_000));
     }
 
     #[tokio::test]

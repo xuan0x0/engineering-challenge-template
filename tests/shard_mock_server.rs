@@ -123,6 +123,7 @@ async fn shard_subscribes_forwards_resyncs_and_closes() {
     let cancel = CancellationToken::new();
     let cfg = ShardConfig {
         shard_id: 0,
+        replica: 1,
         ws_url: format!("ws://{addr}/trade-api/ws/v2"),
         signer: Arc::new(Signer::new(
             "test-key",
@@ -130,6 +131,8 @@ async fn shard_subscribes_forwards_resyncs_and_closes() {
         )),
         events: events_tx,
         cancel: cancel.clone(),
+        recycle_interval: None,
+        replica_count: 2,
     };
     let shard = tokio::spawn(run_shard(cfg, cmd_rx));
     cmd_tx
@@ -138,12 +141,13 @@ async fn shard_subscribes_forwards_resyncs_and_closes() {
         .unwrap();
 
     let mut events = Vec::new();
-    for _ in 0..3 {
-        let event = tokio::time::timeout(TIMEOUT, events_rx.recv())
+    for _ in 0..4 {
+        let sourced = tokio::time::timeout(TIMEOUT, events_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        events.push(event);
+        assert_eq!(sourced.replica, 1, "events are tagged with their replica");
+        events.push(sourced.event);
     }
     cancel.cancel();
     tokio::time::timeout(TIMEOUT, shard).await.unwrap().unwrap();
@@ -165,8 +169,15 @@ async fn shard_subscribes_forwards_resyncs_and_closes() {
             ..
         }
     ));
+    assert_eq!(
+        events[2],
+        BookEvent::Invalidated {
+            symbols: vec!["M".to_owned()]
+        },
+        "books from the dropped subscription are invalidated"
+    );
     assert!(
-        matches!(&events[2], BookEvent::Snapshot { .. }),
+        matches!(&events[3], BookEvent::Snapshot { .. }),
         "fresh snapshot after resync"
     );
     assert!(

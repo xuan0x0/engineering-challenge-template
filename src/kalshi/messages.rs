@@ -90,6 +90,8 @@ pub struct SnapshotMsg {
     pub yes_dollars_fp: Vec<(Decimal, Decimal)>,
     #[serde(default)]
     pub no_dollars_fp: Vec<(Decimal, Decimal)>,
+    /// Per-market ordering key, comparable across connections.
+    pub clock: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -99,6 +101,7 @@ pub struct DeltaMsg {
     pub delta_fp: Decimal,
     pub side: KalshiSide,
     pub ts_ms: Option<i64>,
+    pub clock: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -145,6 +148,7 @@ impl SnapshotMsg {
             symbol: self.market_ticker.clone(),
             received_at,
             exchange_timestamp: millis_to_utc(sending_ts_ms, received_at),
+            sequence: self.clock,
             bids: levels(&self.yes_dollars_fp, KalshiSide::Yes)?,
             asks: levels(&self.no_dollars_fp, KalshiSide::No)?,
         })
@@ -162,6 +166,7 @@ impl DeltaMsg {
             symbol: self.market_ticker.clone(),
             received_at,
             exchange_timestamp: millis_to_utc(self.ts_ms.or(sending_ts_ms), received_at),
+            sequence: self.clock,
             side,
             price,
             quantity_delta: self.delta_fp.to_fixed()?,
@@ -309,6 +314,7 @@ mod tests {
                 symbol: "FED-23DEC-T3.00".to_owned(),
                 received_at: t0(),
                 exchange_timestamp: DateTime::from_timestamp_millis(1_700_000_000_250).unwrap(),
+                sequence: Some(4182061),
                 side: Side::Sell,
                 price: 40_000,
                 quantity_delta: -54_000_000,
@@ -389,6 +395,7 @@ mod tests {
             delta_fp: Decimal::Int(1),
             side: KalshiSide::Yes,
             ts_ms: None,
+            clock: None,
         };
         assert!(msg.to_event(t0(), None).is_err());
     }

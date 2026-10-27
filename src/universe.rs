@@ -116,23 +116,27 @@ impl Assignment {
     }
 }
 
+/// The redundant connections serving one shard's symbols. Every replica gets
+/// the same commands.
 struct Shard {
-    commands: mpsc::Sender<ShardCmd>,
-    handle: JoinHandle<()>,
+    replicas: Vec<(mpsc::Sender<ShardCmd>, JoinHandle<()>)>,
 }
 
 /// Periodically refreshes the symbol set and keeps shards subscribed to it.
-/// On cancellation, waits for every shard task to finish before returning.
+/// Each shard is served by `replicas` redundant connections, spawned with
+/// `spawn_shard(shard_id, replica, commands)`. On cancellation, waits for
+/// every connection task to finish before returning.
 pub async fn run<F, Fut, S>(
     fetch_symbols: F,
     spawn_shard: S,
+    replicas: usize,
     limits: ShardLimits,
     refresh_interval: Duration,
     cancel: CancellationToken,
 ) where
     F: Fn() -> Fut,
     Fut: Future<Output = anyhow::Result<BTreeSet<String>>>,
-    S: Fn(usize, mpsc::Receiver<ShardCmd>) -> JoinHandle<()>,
+    S: Fn(usize, usize, mpsc::Receiver<ShardCmd>) -> JoinHandle<()>,
 {
     let mut assignment = Assignment::new(limits);
     let mut shards: Vec<Shard> = Vec::new();
@@ -170,12 +174,14 @@ pub async fn run<F, Fut, S>(
         }
         for (shard, symbols) in assignment.assign(&added) {
             while shards.len() <= shard {
-                let (tx, rx) = mpsc::channel(64);
-                let handle = spawn_shard(shards.len(), rx);
-                shards.push(Shard {
-                    commands: tx,
-                    handle,
-                });
+                let shard_id = shards.len();
+                let replicas = (0..replicas)
+                    .map(|replica| {
+                        let (tx, rx) = mpsc::channel(64);
+                        (tx, spawn_shard(shard_id, replica, rx))
+                    })
+                    .collect();
+                shards.push(Shard { replicas });
             }
             send(&shards[shard], ShardCmd::Add(symbols)).await;
         }
@@ -189,17 +195,19 @@ pub async fn run<F, Fut, S>(
     }
 
     tracing::info!(shards = shards.len(), "waiting for shards to shut down");
-    for shard in shards {
-        drop(shard.commands);
-        if let Err(e) = shard.handle.await {
+    for (commands, handle) in shards.into_iter().flat_map(|s| s.replicas) {
+        drop(commands);
+        if let Err(e) = handle.await {
             tracing::error!(error = %e, "shard task panicked");
         }
     }
 }
 
 async fn send(shard: &Shard, cmd: ShardCmd) {
-    if shard.commands.send(cmd).await.is_err() {
-        tracing::error!("shard task exited unexpectedly; command dropped");
+    for (commands, _) in &shard.replicas {
+        if commands.send(cmd.clone()).await.is_err() {
+            tracing::error!("shard task exited unexpectedly; command dropped");
+        }
     }
 }
 
@@ -280,7 +288,7 @@ mod tests {
             set(&["A", "B", "C"]),
             set(&["B", "C", "D"]),
         ]));
-        let received: Arc<Mutex<Vec<(usize, ShardCmd)>>> = Arc::default();
+        let received: Arc<Mutex<Vec<(usize, usize, ShardCmd)>>> = Arc::default();
         let cancel = CancellationToken::new();
 
         let fetch = {
@@ -309,11 +317,11 @@ mod tests {
         };
         let spawn = {
             let received = received.clone();
-            move |id: usize, mut rx: mpsc::Receiver<ShardCmd>| {
+            move |id: usize, replica: usize, mut rx: mpsc::Receiver<ShardCmd>| {
                 let received = received.clone();
                 tokio::spawn(async move {
                     while let Some(cmd) = rx.recv().await {
-                        received.lock().unwrap().push((id, cmd));
+                        received.lock().unwrap().push((id, replica, cmd));
                     }
                 })
             }
@@ -322,6 +330,7 @@ mod tests {
         run(
             fetch,
             spawn,
+            2,
             limits(2, 10),
             Duration::from_millis(1),
             cancel,
@@ -329,14 +338,22 @@ mod tests {
         .await;
 
         let got = received.lock().unwrap().clone();
-        assert_eq!(
-            got,
-            vec![
-                (0, ShardCmd::Add(vec(&["A", "B"]))),
-                (1, ShardCmd::Add(vec(&["C"]))),
-                (0, ShardCmd::Remove(vec(&["A"]))),
-                (0, ShardCmd::Add(vec(&["D"]))),
-            ]
-        );
+        for replica in 0..2 {
+            let per_replica: Vec<(usize, ShardCmd)> = got
+                .iter()
+                .filter(|(_, r, _)| *r == replica)
+                .map(|(id, _, cmd)| (*id, cmd.clone()))
+                .collect();
+            assert_eq!(
+                per_replica,
+                vec![
+                    (0, ShardCmd::Add(vec(&["A", "B"]))),
+                    (1, ShardCmd::Add(vec(&["C"]))),
+                    (0, ShardCmd::Remove(vec(&["A"]))),
+                    (0, ShardCmd::Add(vec(&["D"]))),
+                ],
+                "replica {replica} must receive every command"
+            );
+        }
     }
 }

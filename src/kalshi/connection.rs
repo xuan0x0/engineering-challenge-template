@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::auth::Signer;
 use super::messages::Incoming;
 use super::subscription::{Fault, SubscriptionState};
-use crate::events::BookEvent;
+use crate::events::{BookEvent, ReplicaId, SourcedEvent};
 use crate::universe::ShardCmd;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -44,10 +44,18 @@ const STARTUP_STAGGER: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct ShardConfig {
     pub shard_id: usize,
+    /// Which of the shard's redundant connections this is.
+    pub replica: ReplicaId,
     pub ws_url: String,
     pub signer: Arc<Signer>,
-    pub events: mpsc::Sender<BookEvent>,
+    pub events: mpsc::Sender<SourcedEvent>,
     pub cancel: CancellationToken,
+    /// Proactively reconnect this often, to shed any state the exchange has
+    /// accumulated on a long-lived socket. `None` disables recycling.
+    pub recycle_interval: Option<Duration>,
+    /// Number of replicas per shard, used to stagger recycling so a shard's
+    /// replicas are never down at the same time.
+    pub replica_count: usize,
 }
 
 enum SessionEnd {
@@ -58,10 +66,15 @@ enum SessionEnd {
 
 pub async fn run_shard(cfg: ShardConfig, mut commands: mpsc::Receiver<ShardCmd>) {
     let shard = cfg.shard_id;
+    let replica = cfg.replica;
     let mut state = SubscriptionState::default();
     let mut backoff = MIN_BACKOFF;
+    let mut sessions: u32 = 0;
 
-    let stagger = STARTUP_STAGGER * u32::try_from(shard).unwrap_or(u32::MAX);
+    // Replicas of a shard start half a stagger apart so they don't share fate
+    // at connect time.
+    let stagger = STARTUP_STAGGER * u32::try_from(shard).unwrap_or(u32::MAX)
+        + STARTUP_STAGGER / 2 * u32::try_from(replica).unwrap_or(u32::MAX);
     tokio::select! {
         _ = cfg.cancel.cancelled() => return,
         _ = tokio::time::sleep(stagger) => {}
@@ -74,16 +87,30 @@ pub async fn run_shard(cfg: ShardConfig, mut commands: mpsc::Receiver<ShardCmd>)
         };
         let end = match connected {
             Ok(ws) => {
-                tracing::info!(shard, "connected");
+                tracing::info!(shard, replica, "connected");
                 state.reset_connection();
-                session(&cfg, ws, &mut state, &mut commands, &mut backoff).await
+                let recycle_at = recycle_deadline(&cfg, sessions);
+                sessions = sessions.saturating_add(1);
+                session(
+                    &cfg,
+                    ws,
+                    &mut state,
+                    &mut commands,
+                    &mut backoff,
+                    recycle_at,
+                )
+                .await
             }
             Err(e) => SessionEnd::Disconnected(format!("connect failed: {e:#}")),
         };
         match end {
             SessionEnd::Shutdown => break,
             SessionEnd::Disconnected(reason) => {
-                tracing::warn!(shard, %reason, retry_in = ?backoff, "disconnected");
+                tracing::warn!(shard, replica, %reason, retry_in = ?backoff, "disconnected");
+                // Until we resnapshot, this connection's books are stale.
+                if !invalidate_all(&cfg, &mut state).await {
+                    break;
+                }
             }
         }
         tokio::select! {
@@ -92,7 +119,39 @@ pub async fn run_shard(cfg: ShardConfig, mut commands: mpsc::Receiver<ShardCmd>)
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
-    tracing::info!(shard, "shard stopped");
+    tracing::info!(shard, replica, "shard stopped");
+}
+
+/// Forwards an event to the collector. Returns false if the collector is gone.
+async fn emit(cfg: &ShardConfig, event: BookEvent) -> bool {
+    cfg.events
+        .send(SourcedEvent {
+            replica: cfg.replica,
+            event,
+        })
+        .await
+        .is_ok()
+}
+
+/// Tells the collector every book from this connection is untrustworthy.
+async fn invalidate_all(cfg: &ShardConfig, state: &mut SubscriptionState) -> bool {
+    let symbols = state.take_snapshotted();
+    symbols.is_empty() || emit(cfg, BookEvent::Invalidated { symbols }).await
+}
+
+/// When this session should be recycled. The first session of replica `r` is
+/// cut short to `(r + 1) / replica_count` of the interval, which spreads a
+/// shard's replicas evenly around the cycle.
+fn recycle_deadline(cfg: &ShardConfig, sessions: u32) -> Option<Instant> {
+    let interval = cfg.recycle_interval?;
+    let first = if sessions == 0 {
+        let count = u32::try_from(cfg.replica_count.max(1)).unwrap_or(u32::MAX);
+        let slot = u32::try_from(cfg.replica + 1).unwrap_or(u32::MAX);
+        interval / count * slot.min(count)
+    } else {
+        interval
+    };
+    Some(Instant::now() + first)
 }
 
 /// Adds up to 50% random jitter so shards that failed together don't retry in
@@ -134,6 +193,7 @@ async fn session(
     state: &mut SubscriptionState,
     commands: &mut mpsc::Receiver<ShardCmd>,
     backoff: &mut Duration,
+    recycle_at: Option<Instant>,
 ) -> SessionEnd {
     let shard = cfg.shard_id;
     let (mut sink, mut stream) = ws.split();
@@ -187,7 +247,7 @@ async fn session(
                 let mut outgoing = Vec::new();
                 match handle_text(text.as_str(), received_at, state, &mut outgoing) {
                     Ok(Some(event)) => {
-                        if cfg.events.send(event).await.is_err() {
+                        if !emit(cfg, event).await {
                             return SessionEnd::Shutdown;
                         }
                     }
@@ -196,8 +256,11 @@ async fn session(
                         if last_resync.is_some_and(|t| t.elapsed() < MIN_RESYNC_INTERVAL) {
                             return SessionEnd::Disconnected(format!("repeated resyncs: {reason}"));
                         }
-                        tracing::warn!(shard, %reason, "resubscribing");
+                        tracing::warn!(shard, replica = cfg.replica, %reason, "resubscribing");
                         last_resync = Some(Instant::now());
+                        if !invalidate_all(cfg, state).await {
+                            return SessionEnd::Shutdown;
+                        }
                         outgoing.extend(state.resync());
                     }
                     Err(Fault::Rejected(reason)) => {
@@ -220,6 +283,11 @@ async fn session(
                 }
                 send_all!(state.reconcile());
             }
+            () = sleep_until_opt(recycle_at) => {
+                tracing::info!(shard, replica = cfg.replica, "recycling socket");
+                close(cfg, &mut sink, &mut stream, state).await;
+                return SessionEnd::Disconnected("scheduled recycle".to_owned());
+            }
             _ = ping.tick() => {
                 if last_frame.elapsed() > STALE_TIMEOUT {
                     return SessionEnd::Disconnected("no frames received; socket stale".to_owned());
@@ -232,13 +300,20 @@ async fn session(
     }
 }
 
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Updates the desired market set. Returns false if the collector is gone.
 async fn apply_command(cfg: &ShardConfig, state: &mut SubscriptionState, cmd: ShardCmd) -> bool {
     match cmd {
         ShardCmd::Add(tickers) => state.add(tickers),
         ShardCmd::Remove(tickers) => {
             for event in state.remove(tickers) {
-                if cfg.events.send(event).await.is_err() {
+                if !emit(cfg, event).await {
                     return false;
                 }
             }
@@ -291,7 +366,7 @@ async fn drain_after_close(
             continue;
         };
         if let Ok(Some(event)) = handle_text(text.as_str(), received_at, state, &mut Vec::new())
-            && cfg.events.send(event).await.is_err()
+            && !emit(cfg, event).await
         {
             break;
         }

@@ -67,6 +67,12 @@ impl SubscriptionState {
         self.snapshotted.clear();
     }
 
+    /// Markets whose book this connection has published since its last
+    /// snapshot. Call before a reset or resync to invalidate them downstream.
+    pub fn take_snapshotted(&mut self) -> Vec<String> {
+        self.snapshotted.drain().collect()
+    }
+
     pub fn add(&mut self, tickers: Vec<String>) {
         self.desired.extend(tickers);
     }
@@ -250,12 +256,15 @@ impl SubscriptionState {
     }
 
     /// Stops forwarding deltas for a market whose message we could not
-    /// interpret, and tells the collector to drop its (now unreliable) book.
+    /// interpret, and tells the collector its book from this connection is
+    /// unreliable.
     /// The market recovers on its next snapshot (resync or reconnect).
     fn quarantine(&mut self, symbol: String, error: &anyhow::Error) -> BookEvent {
         tracing::error!(%symbol, error = %format!("{error:#}"), "uninterpretable message; market quarantined");
         self.snapshotted.remove(&symbol);
-        BookEvent::Removed { symbol }
+        BookEvent::Invalidated {
+            symbols: vec![symbol],
+        }
     }
 
     /// Validates sequencing for a book message and decides whether it is for a
@@ -325,6 +334,7 @@ mod tests {
                 market_ticker: ticker.to_owned(),
                 yes_dollars_fp: vec![(Decimal::Str("0.40".into()), Decimal::Str("1".into()))],
                 no_dollars_fp: vec![],
+                clock: Some(seq),
             },
             sending_ts_ms: None,
         }
@@ -340,6 +350,7 @@ mod tests {
                 delta_fp: Decimal::Str("2".into()),
                 side: KalshiSide::Yes,
                 ts_ms: None,
+                clock: Some(seq),
             },
             sending_ts_ms: None,
         }
@@ -516,8 +527,8 @@ mod tests {
         let event = s.on_message(bad, t0(), &mut out).unwrap();
         assert_eq!(
             event,
-            Some(BookEvent::Removed {
-                symbol: "A".to_owned()
+            Some(BookEvent::Invalidated {
+                symbols: vec!["A".to_owned()]
             })
         );
         assert!(

@@ -68,6 +68,22 @@ struct Args {
     #[arg(long, default_value_t = 120)]
     discovery_interval_secs: u64,
 
+    /// Redundant websockets per set of markets. The published data comes from
+    /// one of them; the others are hot standbys (see `market.rs`).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=4))]
+    replicas: u64,
+
+    /// Fail over when a backup socket has delivered an update the source
+    /// hasn't for this long.
+    #[arg(long, default_value_t = 500)]
+    failover_lag_ms: u64,
+
+    /// Proactively reconnect each socket this often (0 disables). Replicas of
+    /// a shard recycle at staggered times, so with `--replicas` >= 2 there is
+    /// always a live source.
+    #[arg(long, default_value_t = 1800)]
+    recycle_interval_secs: u64,
+
     /// How often to write a full snapshot of every book.
     #[arg(long, default_value_t = 60)]
     snapshot_interval_secs: u64,
@@ -107,11 +123,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let writer = RotatingWriter::open(target, Utc::now())?;
 
+    let replicas = usize::try_from(args.replicas)?;
     let cancel = CancellationToken::new();
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
     let mut collector_task = tokio::spawn(collector::run(
-        Collector::new(writer),
+        Collector::new(
+            writer,
+            replicas,
+            Duration::from_millis(args.failover_lag_ms),
+        ),
         events_rx,
         Duration::from_secs(args.snapshot_interval_secs),
         cancel.clone(),
@@ -131,16 +152,21 @@ async fn main() -> anyhow::Result<()> {
     };
     let shard_template = ShardConfig {
         shard_id: 0,
+        replica: 0,
         ws_url: args.ws_url.clone(),
         signer,
         events: events_tx,
         cancel: cancel.clone(),
+        recycle_interval: (args.recycle_interval_secs > 0)
+            .then(|| Duration::from_secs(args.recycle_interval_secs)),
+        replica_count: replicas,
     };
     let spawn = {
         let template = shard_template.clone();
-        move |shard_id, commands| {
+        move |shard_id, replica, commands| {
             let cfg = ShardConfig {
                 shard_id,
+                replica,
                 ..template.clone()
             };
             tokio::spawn(run_shard(cfg, commands))
@@ -152,9 +178,11 @@ async fn main() -> anyhow::Result<()> {
     let mut universe_task = tokio::spawn(universe::run(
         fetch,
         spawn,
+        replicas,
         ShardLimits {
             max_per_shard: usize::try_from(args.markets_per_connection)?,
-            max_shards: usize::try_from(args.max_connections)?,
+            // Each shard uses `replicas` connections out of the budget.
+            max_shards: (usize::try_from(args.max_connections)? / replicas).max(1),
         },
         Duration::from_secs(args.discovery_interval_secs),
         cancel.clone(),
